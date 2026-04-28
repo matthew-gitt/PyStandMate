@@ -1,9 +1,9 @@
 --pystand-version
 1.0.11
 --python-version
-3.8.10
+3.12.0
 --bitness
-32
+64
 --compiler
 MSVC
 --pystand-int
