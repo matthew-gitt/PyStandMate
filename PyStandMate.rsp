@@ -9,6 +9,6 @@ MSVC
 --pystand-int
 PyStand.int
 --package
-requirements.txt
+pynput pywin32
 --pip-index-url
 https://pypi.tuna.tsinghua.edu.cn/simple
