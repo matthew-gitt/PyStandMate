@@ -1,380 +1,245 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-# Usage:
-# PyStandMate.py --help
-# PyStandMate.py --response-file PyStandMate.rsp
-# PyStandMate.py --bitness 32 --compiler MSVC --python-version 3.8.10 --console
-# PyStandMate.py --compiler MSVC --python-version 3.8.10 --package PyQt5 --pip-index-url https://pypi.doubanio.com/simple
-# PyStandMate.py --bitness 64 --compiler MSVC --python-version 3.8.10 --package PyQt5 --pip-index-url https://pypi.doubanio.com/simple
-# PyStandMate.py --bitness 64 --compiler MSVC --python-version 3.10.0 --package PyQt6 --pip-index-url https://pypi.doubanio.com/simple
-
-import argparse
-import collections
 import os
-from pathlib import Path
-from pprint import pprint
-import re
-import shutil
+import time
+import threading
+import queue
 import subprocess
-import sys
-import urllib.parse
-import urllib.request
-import zipfile
+import tkinter as tk
+from tkinter import filedialog, messagebox
+from pathlib import Path
+
+from pynput import keyboard, mouse
+
+import win32gui
+import win32api
+import win32con
+import ctypes
+
+# =========================
+# SendInput 封装（增强版）
+# =========================
+
+SendInput = ctypes.windll.user32.SendInput
+
+SCREEN_W = win32api.GetSystemMetrics(0)
+SCREEN_H = win32api.GetSystemMetrics(1)
+
+PUL = ctypes.POINTER(ctypes.c_ulong)
+
+class INPUT(ctypes.Structure):
+    class _I(ctypes.Union):
+        _fields_ = [("mi", ctypes.c_ulong * 7), ("ki", ctypes.c_ulong * 7)]
+    _anonymous_ = ("i",)
+    _fields_ = [("type", ctypes.c_ulong), ("i", _I)]
 
 
-EmbedPython = collections.namedtuple("EmbedPython", ["url", "filename"])
-
-DOWNLOAD_DIR = "download"
-BUILD_DIR = "build"
-PUBLISH_DIR = "publish"
-
-DEFAULT_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_6) AppleWebKit/603.3.8 (KHTML, like Gecko) Version/10.1.2 Safari/603.3.8"
+def to_absolute(x, y):
+    return int(x * 65535 / SCREEN_W), int(y * 65535 / SCREEN_H)
 
 
-class LoadFromFile(argparse.Action):
-    def __call__(self, parser, namespace, values, option_string=None):
-        with values as f:
-            # parse arguments in the file and store them in the target namespace
-            parser.parse_args(f.read().split(), namespace)
-
-
-def fetch_page(url, encoding="utf-8"):
-    request = urllib.request.Request(url, headers={"User-Agent": DEFAULT_USER_AGENT})
-    response = urllib.request.urlopen(request)
-
-    if encoding:
-        charset = response.headers.get_content_charset(failobj=encoding)
-        for line in response:
-            yield line.decode(charset)
-    else:
-        yield from response
-
-
-def fetch_page_contents(url, encoding="utf-8"):
-    return "".join(fetch_page(url, encoding))
-
-
-def find_urls(s):
-    return re.findall(r'href=[\'"]?([^\'" >]+)', s)
-
-
-def download_pystand(version, target_dir):
-    if version.startswith("v") or version.startswith("V"):
-        version = version[1:]
-
-    filename = f"PyStand-v{version}-exe.zip"
-    pystand_path = target_dir / filename
-
-    if not pystand_path.is_file():
-        if not target_dir.is_dir():
-            print(f"Create directory {target_dir}...")
-            target_dir.mkdir()
-
-        dload_url = f"https://github.com/skywind3000/PyStand/releases/download/{version}/{filename}"
-        print(f"Download {dload_url} -> {filename}...")
-        urllib.request.urlretrieve(dload_url, pystand_path)
-
-    return pystand_path
-
-
-def get_pystand_subdir(compiler, bitness, is_console):
-    subsystem = "CLI" if is_console else "GUI"
-
-    if compiler == "MSVC":
-        arch = "Win32" if bitness == 32 else "x64"
-    else:
-        arch = "mingw32" if bitness == 32 else "mingw64"
-
-    return f"PyStand-{arch}-{subsystem}"
-
-
-def get_pystand_publish_subdir(version, compiler, bitness, is_console):
-    if version.startswith("v") or version.startswith("V"):
-        version = version[1:]
-
-    subdir = get_pystand_subdir(compiler, bitness, is_console)
-    subdir = subdir.replace("PyStand", f"PyStand-v{version}")
-
-    return subdir
-
-
-def get_embed_python_versions():
-    page_contents = fetch_page_contents("https://www.python.org/downloads/windows/")
-    dload_urls = find_urls(page_contents)
-
-    result = collections.OrderedDict()
-
-    for url in dload_urls:
-        url_parts = urllib.parse.urlparse(url)
-        if Path(url_parts.path).match("*embed*.zip"):
-            version = url_parts.path.split("-")[1]
-            embed_python = EmbedPython(url, Path(url_parts.path).name)
-            if not version in result:
-                result[version] = [embed_python]
-            else:
-                result[version].append(embed_python)
-
-    return result
-
-
-def download_embed_python(version, bitness, target_dir):
-    arch = "win32" if bitness == 32 else "amd64"
-    filename = f"python-{version}-embed-{arch}.zip"
-    embed_python_path = target_dir / filename
-
-    if not embed_python_path.is_file():
-        print(f"{filename} doesn't exist, will download it first.")
-
-        print("Get available Windows embeddable Python packages...")
-        embed_python_versions = get_embed_python_versions()
-
-        if version not in embed_python_versions:
-            print(f"Couldn't find embeddable Python package of version {version}.")
-            print("Available versions:")
-            pprint(tuple(embed_python_versions.keys()))
-            sys.exit(1)
-
-        if not target_dir.is_dir():
-            print(f"Create directory {target_dir}...")
-            target_dir.mkdir()
-
-        embed_python_list = embed_python_versions[version]
-        for embed_python in embed_python_list:
-            if arch in embed_python.filename:
-                print(f"Download {embed_python.url} -> {embed_python.filename}...")
-                urllib.request.urlretrieve(embed_python.url, embed_python_path)
-                break
-
-    if not embed_python_path.is_file():
-        print(f"Couldn't find a suitable version of embeddable Python.")
-        sys.exit(2)
-
-    return embed_python_path
-
-
-def install_pip(embed_python_dir, get_pip_path):
-    pth_files = tuple(embed_python_dir.glob("*._pth"))
-    if pth_files:
-        if len(pth_files) != 1:
-            print("There are more than one ._pth files:")
-            pprint(pth_files)
-            sys.exit(3)
-
-        pth_file = pth_files[0]
-
-        print("Uncomment import site...")
-
-        with open(pth_file, "r") as fp:
-            pth_file_content = fp.read()
-
-        pth_file_content = pth_file_content.replace("#import site", "import site")
-        with open(pth_file, "w") as fp:
-            fp.write(pth_file_content)
-
-    print("Install pip...")
-    python = embed_python_dir / "python.exe"
-    # subprocess.run([python, get_pip_path])
-    subprocess.run(["cmd", "/C", python, get_pip_path], check=True)
-
-
-def install_package(embed_python_dir, package, pip_index_url):
-    python = embed_python_dir / "python.exe"
-
-    args = ["cmd", "/C", python, "-m", "pip", "install", package]
-    if pip_index_url:
-        args.extend(["-i", pip_index_url])
-
-    subprocess.run(args, check=True)
-
-
-def install_requirements(embed_python_dir, requirements_file, pip_index_url):
-    python = embed_python_dir / "python.exe"
-
-    args = ["cmd", "/C", python, "-m", "pip", "install", "-r", requirements_file]
-    if pip_index_url:
-        args.extend(["-i", pip_index_url])
-
-    subprocess.run(args, check=True)
-
-
-def install_packages(embed_python_dir, packages, pip_index_url):
-    for package in packages:
-        if "requirements.txt" in Path(package).name:
-            install_requirements(embed_python_dir, package, pip_index_url)
-        else:
-            install_package(embed_python_dir, package, pip_index_url)
-
-
-def main():
-    script_path = Path(sys.argv[0])
-    script_dir = script_path.parent
-
-    parser = argparse.ArgumentParser(
-        prog=script_path.stem,
-        description="PyStand packaging mate.",
+def send_mouse_abs(x, y, flags):
+    ax, ay = to_absolute(x, y)
+    ctypes.windll.user32.mouse_event(
+        flags | win32con.MOUSEEVENTF_ABSOLUTE,
+        ax, ay, 0, 0
     )
 
-    parser.add_argument("--pystand-version", default="1.0.11", help="PyStand version")
-    parser.add_argument(
-        "--bitness", type=int, choices=(32, 64), default=32, help="Bitness"
-    )
-    parser.add_argument(
-        "--compiler", choices=("MSVC", "GCC"), default="MSVC", help="Compiler"
-    )
-    parser.add_argument(
-        "--console", action="store_true", help="Use PyStand CLI instead of GUI"
-    )
-    parser.add_argument(
-        "--pystand-int", default="PyStand.int", help="PyStand.int script"
-    )
-    parser.add_argument("--python-version", default="3.8.10", help="Python version")
-    parser.add_argument(
-        "--package", nargs="+", help="A list of 3rd-party packages to be installed"
-    )
-    parser.add_argument(
-        "--pip-index-url",
-        help="Base url of Python package index",
-    )
-    parser.add_argument(
-        "--response-file",
-        type=open,
-        action=LoadFromFile,
-        help="Read options stored in a response file",
-    )
 
-    args = parser.parse_args()
+def send_key_scancode(vk, down=True):
+    scan = win32api.MapVirtualKey(vk, 0)
+    flags = win32con.KEYEVENTF_SCANCODE
+    if not down:
+        flags |= win32con.KEYEVENTF_KEYUP
 
-    # 1. Download PyStand
-    pystand_path = download_pystand(args.pystand_version, script_dir / DOWNLOAD_DIR)
+    ctypes.windll.user32.keybd_event(0, scan, flags, 0)
 
-    # 2. Extract PyStand
-    pystand_dir = script_dir / BUILD_DIR / pystand_path.stem
-    print(f"Extract {pystand_path.name} -> {pystand_dir.name}...")
-    with zipfile.ZipFile(pystand_path, "r") as zip_ref:
-        zip_ref.extractall(pystand_dir)
 
-    # 3. Download Python
-    embed_python_path = download_embed_python(
-        args.python_version, args.bitness, script_dir / DOWNLOAD_DIR
-    )
+# =========================
+# 输入队列（核心）
+# =========================
 
-    # 4. Extract Python
-    embed_python_dir = script_dir / BUILD_DIR / embed_python_path.stem
-    if embed_python_dir.is_dir():
-        print("Remove build directory...")
-        shutil.rmtree(embed_python_dir)
-    print(f"Extract {embed_python_path.name} -> {embed_python_dir.name}...")
-    with zipfile.ZipFile(embed_python_path, "r") as zip_ref:
-        zip_ref.extractall(embed_python_dir)
+input_queue = queue.Queue()
 
-    # 5. Put together
-    pystand_publish_subdir = get_pystand_publish_subdir(
-        args.pystand_version, args.compiler, args.bitness, args.console
-    )
-    pystand_publish_dir = script_dir / PUBLISH_DIR / pystand_publish_subdir
-    if pystand_publish_dir.is_dir():
-        print(f"Remove publish directory...")
-        shutil.rmtree(pystand_publish_dir)
-    if not pystand_publish_dir.is_dir():
-        print(f"Create directory {PUBLISH_DIR}{os.sep}{pystand_publish_subdir}...")
-        pystand_publish_dir.mkdir(parents=True)
-    # 5.1 Copy PyStand
-    pystand_subdir = get_pystand_subdir(args.compiler, args.bitness, args.console)
-    pystand_src_path = pystand_dir / pystand_subdir / "PyStand.exe"
-    pystand_dst_path = pystand_publish_dir / "PyStand.exe"
-    print(f"Copy PyStand...")
-    shutil.copy2(pystand_src_path, pystand_dst_path)
-    # 5.2 Copy Python
-    print(f"Copy Python...")
-    runtime_dir = pystand_publish_dir / "runtime"
-    shutil.copytree(embed_python_dir, runtime_dir, dirs_exist_ok=True)
-    # 5.3 Copy PyStand.int
-    pystand_int_path = Path(args.pystand_int)
-    if pystand_int_path.is_file():
-        print(f"Copy {pystand_int_path.name} -> PyStand.int...")
-        shutil.copy2(pystand_int_path, pystand_publish_dir / "PyStand.int")
-    else:
-        print(f"{pystand_int_path} is not a regular file.")
 
-    if not args.package:
-        sys.exit(0)
+def input_worker():
+    while True:
+        item = input_queue.get()
 
-    # 6. Download & install pip
-    get_pip_path = script_dir / DOWNLOAD_DIR / "get-pip.py"
-    if not get_pip_path.is_file():
-        print("Download get-pip.py...")
-        urllib.request.urlretrieve("https://bootstrap.pypa.io/get-pip.py", get_pip_path)
+        if item["type"] == "mouse":
+            send_mouse_abs(item["x"], item["y"], item["flag"])
 
-    target_get_pip_path = embed_python_dir / "get-pip.py"
-    shutil.copyfile(get_pip_path, target_get_pip_path)
-    install_pip(embed_python_dir, target_get_pip_path)
+        elif item["type"] == "key":
+            send_key_scancode(item["vk"], item["down"])
 
-    # 7. Memorize files and directories that are created by installing pip and setuptools.
-    pip_facilities = [target_get_pip_path]
-    site_packages_dir = embed_python_dir / "Lib" / "site-packages"
-    scripts_dir = embed_python_dir / "Scripts"
-    pip_facilities.extend(tuple(site_packages_dir.iterdir()))
-    pip_facilities.extend(tuple(scripts_dir.iterdir()))
-    # pprint(pip_facilities)
+        input_queue.task_done()
 
-    # 8. Install packages
-    print("Install packages...")
-    install_packages(embed_python_dir, args.package, args.pip_index_url)
 
-    # 9. Remove pip and setuptools.
-    print("Remove pip and setuptools...")
-    for facility in pip_facilities:
-        if facility.is_file():
-            print(f"Remove file {facility.name}...")
-            facility.unlink(missing_ok=True)
-        elif facility.is_dir():
-            print(f"Remove directory {facility.name}...")
-            shutil.rmtree(facility)
+threading.Thread(target=input_worker, daemon=True).start()
 
-    # 10. Copy site-packages.
-    if site_packages_dir.is_dir():
-        # Remove .dist-info folders.
-        for dist_info_dir in site_packages_dir.glob("*.dist-info"):
-            if dist_info_dir.is_dir():
-                print(f"Remove directory {dist_info_dir.name}...")
-                shutil.rmtree(dist_info_dir)
 
-        print("Copy installed packages...")
-        shutil.copytree(
-            site_packages_dir, pystand_publish_dir / "site-packages", dirs_exist_ok=True
-        )
+# =========================
+# VM 数据
+# =========================
 
+class VMItem:
+    def __init__(self, path):
+        self.path = path
+        self.name = os.path.basename(path)
+        self.hwnd = None
+
+
+# =========================
+# 窗口识别
+# =========================
+
+def find_windows(vm_list):
+    def handler(hwnd, _):
+        if not win32gui.IsWindowVisible(hwnd):
+            return
+
+        title = win32gui.GetWindowText(hwnd)
+
+        for vm in vm_list:
+            if vm.name in title:
+                vm.hwnd = hwnd
+
+    win32gui.EnumWindows(handler, None)
+
+
+# =========================
+# 坐标映射
+# =========================
+
+def screen_to_client(hwnd, x, y):
+    return win32gui.ScreenToClient(hwnd, (x, y))
+
+
+def client_to_screen(hwnd, x, y):
+    return win32gui.ClientToScreen(hwnd, (x, y))
+
+
+# =========================
+# 主程序
+# =========================
+
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.vm_list = []
+        self.master = None
+        self.syncing = False
+
+        self.build_ui()
+
+    def build_ui(self):
+        top = tk.Frame(self.root)
+        top.pack()
+
+        tk.Button(top, text="扫描VMX", command=self.scan).pack(side=tk.LEFT)
+        tk.Button(top, text="启动VM", command=self.start_vms).pack(side=tk.LEFT)
+        tk.Button(top, text="设主控", command=self.set_master).pack(side=tk.LEFT)
+        tk.Button(top, text="开始同步", command=self.start_sync).pack(side=tk.LEFT)
+
+        self.listbox = tk.Listbox(self.root)
+        self.listbox.pack(fill=tk.BOTH, expand=True)
+
+    def scan(self):
+        d = filedialog.askdirectory()
+        for f in Path(d).rglob("*.vmx"):
+            vm = VMItem(str(f))
+            self.vm_list.append(vm)
+            self.listbox.insert(tk.END, vm.name)
+
+    def start_vms(self):
+        for vm in self.vm_list:
+            subprocess.Popen(["vmware.exe", vm.path])
+
+        time.sleep(5)
+        find_windows(self.vm_list)
+
+    def set_master(self):
+        idx = self.listbox.curselection()
+        if not idx:
+            return
+        self.master = self.vm_list[idx[0]]
+        messagebox.showinfo("OK", "主控设置成功")
+
+    def start_sync(self):
+        if not self.master:
+            return
+
+        self.syncing = True
+        threading.Thread(target=self.sync_loop, daemon=True).start()
+
+    def sync_loop(self):
+
+        def on_move(x, y):
+            if not self.syncing:
+                return
+
+            for vm in self.vm_list:
+                if vm == self.master or not vm.hwnd:
+                    continue
+
+                cx, cy = screen_to_client(self.master.hwnd, x, y)
+                tx, ty = client_to_screen(vm.hwnd, cx, cy)
+
+                input_queue.put({
+                    "type": "mouse",
+                    "x": tx,
+                    "y": ty,
+                    "flag": win32con.MOUSEEVENTF_MOVE
+                })
+
+        def on_click(x, y, button, pressed):
+            if not self.syncing:
+                return
+
+            flag = win32con.MOUSEEVENTF_LEFTDOWN if pressed else win32con.MOUSEEVENTF_LEFTUP
+
+            for vm in self.vm_list:
+                if vm == self.master or not vm.hwnd:
+                    continue
+
+                cx, cy = screen_to_client(self.master.hwnd, x, y)
+                tx, ty = client_to_screen(vm.hwnd, cx, cy)
+
+                input_queue.put({
+                    "type": "mouse",
+                    "x": tx,
+                    "y": ty,
+                    "flag": flag
+                })
+
+        def on_key_press(key):
+            try:
+                vk = key.vk if hasattr(key, 'vk') else key.value.vk
+            except:
+                return
+
+            input_queue.put({"type": "key", "vk": vk, "down": True})
+
+        def on_key_release(key):
+            try:
+                vk = key.vk if hasattr(key, 'vk') else key.value.vk
+            except:
+                return
+
+            input_queue.put({"type": "key", "vk": vk, "down": False})
+
+        mouse.Listener(on_move=on_move, on_click=on_click).start()
+        keyboard.Listener(on_press=on_key_press, on_release=on_key_release).start()
+
+        while self.syncing:
+            time.sleep(0.005)
+
+
+# =========================
+# 启动
+# =========================
 
 if __name__ == "__main__":
-    main()
-
-
-# Format code:
-# pip install black
-# black PyStandMate.py
-
-# References:
-# [Regular expression to extract URL from an HTML link](https://stackoverflow.com/questions/499345/regular-expression-to-extract-url-from-an-html-link)
-# [Unzipping files in Python](https://stackoverflow.com/questions/3451111/unzipping-files-in-python)
-# https://gist.github.com/myd7349/9f7c6334e67d1aee68a722a15df4a62a
-# [Replace string within file contents](https://stackoverflow.com/questions/4128144/replace-string-within-file-contents)
-# https://docs.python.org/3.11/library/pathlib.html
-# [Could not find a version that satisfies the requirement setuptools](https://github.com/pypa/pip/issues/7730)
-# [How to run a pip install command from a subproces.run()](https://stackoverflow.com/questions/69345839/how-to-run-a-pip-install-command-from-a-subproces-run)
-# [How can I Install a Python module within code?](https://stackoverflow.com/questions/12332975/how-can-i-install-a-python-module-within-code)
-# [How to run `pip` in a virtualenv with subprocess.check_call()?](https://stackoverflow.com/questions/28574058/how-to-run-pip-in-a-virtualenv-with-subprocess-check-call)
-# [Python: Platform independent way to modify PATH environment variable](https://stackoverflow.com/questions/1681208/python-platform-independent-way-to-modify-path-environment-variable)
-# [Check if Python Package is installed](https://stackoverflow.com/questions/1051254/check-if-python-package-is-installed)
-# [how to get argparse to read arguments from a file with an option rather than prefix](https://stackoverflow.com/questions/27433316/how-to-get-argparse-to-read-arguments-from-a-file-with-an-option-rather-than-pre)
-# [Find default pip index-url](https://stackoverflow.com/questions/50100576/find-default-pip-index-url)
-# [pyqt5 安装 sipbuild](https://www.cnblogs.com/hany-postq473111315/p/15402473.html)
-# [[PyQt] Building PyQt from source with sip v5](https://www.riverbankcomputing.com/pipermail/pyqt/2019-October/042281.html)
-
-# Issues:
-# 1. PyStandMate.py --package parse
-# 2. PyStandMate.py --bitness 32 --compiler MSVC --package PyQt6 --pip-index-url https://pypi.tuna.tsinghua.edu.cn/simple
-#    > ModuleNotFoundError: No module named 'sipbuild'
-# 3. PyStandMate.py --bitness 32 --compiler MSVC --package sip PyQt6 --pip-index-url https://pypi.tuna.tsinghua.edu.cn/simple
-#    > ModuleNotFoundError: No module named 'pyqtbuild'
-# 4. PyStandMate.py --bitness 32 --compiler MSVC --package sip pyqt-builder PyQt6 --pip-index-url https://pypi.tuna.tsinghua.edu.cn/simple
+    root = tk.Tk()
+    root.title("DX增强同步器（用户态极限版）")
+    App(root)
+    root.mainloop()
+  
